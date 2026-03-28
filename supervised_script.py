@@ -27,7 +27,7 @@ READABLE_IDX = CLASS_NAMES.index("Readable")
 BATCH_SIZE = 2
 FRAME_SKIP = 4
 
-torch.set_num_threads(1)
+torch.set_num_threads(torch.get_num_threads())
 print(f"Using {torch.get_num_threads()} CPU thread(s).")
 
 transform = transforms.Compose([
@@ -80,14 +80,14 @@ def infer_batch(model, batch_tensor):
         outputs = (outputs_orig + outputs_flip) / 2
 
         # Readable bias
-        outputs[:, READABLE_IDX] += 0.5
+        outputs[:, READABLE_IDX] += 0.0
 
         probs = torch.softmax(outputs, dim=1)
         pred = outputs.argmax(1)
 
         # Threshold override
         pred = torch.where(
-            probs[:, READABLE_IDX] > 0.4,
+            probs[:, READABLE_IDX] > 0.3,
             torch.full_like(pred, READABLE_IDX),
             pred
         )
