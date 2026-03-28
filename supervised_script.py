@@ -1,13 +1,11 @@
 import os
 import json
 import torch
-import shutil
 import re
 import time
 from pathlib import Path
 from tqdm import tqdm
 from torchvision import transforms
-from PIL import Image
 import cv2
 
 # ---------------- CONFIG ----------------
@@ -26,6 +24,7 @@ READABLE_IDX = CLASS_NAMES.index("Readable")
 
 BATCH_SIZE = 2
 FRAME_SKIP = 4
+MAX_BATCH_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
 
 torch.set_num_threads(torch.get_num_threads())
 print(f"Using {torch.get_num_threads()} CPU thread(s).")
@@ -66,6 +65,12 @@ def parse_json(json_path):
 
     return frame_labels
 
+def get_file_size_bytes(frame):
+    success, encoded = cv2.imencode('.jpg', frame)
+    if not success:
+        return 0
+    return len(encoded)
+
 # ---------------- MODEL ----------------
 def load_model(model_path):
     model = torch.jit.load(model_path, map_location=DEVICE)
@@ -79,13 +84,11 @@ def infer_batch(model, batch_tensor):
         outputs_flip = model(torch.flip(batch_tensor, dims=[3]))
         outputs = (outputs_orig + outputs_flip) / 2
 
-        # Readable bias
         outputs[:, READABLE_IDX] += 0.0
 
         probs = torch.softmax(outputs, dim=1)
         pred = outputs.argmax(1)
 
-        # Threshold override
         pred = torch.where(
             probs[:, READABLE_IDX] > 0.3,
             torch.full_like(pred, READABLE_IDX),
@@ -103,11 +106,26 @@ def run(video_path, json_path, model_path, output_dir):
 
     video_name = video_path.stem
     base_output = Path(output_dir) / video_name
-    correct_dir = base_output / "correct"
-    incorrect_dir = base_output / "incorrect"
 
-    for cls in CLASS_NAMES:
-        os.makedirs(correct_dir / cls, exist_ok=True)
+    current_batch = 1
+    current_batch_size = 0
+    batching_enabled = False
+
+    def get_dirs():
+        if not batching_enabled:
+            correct_dir = base_output / "correct"
+            incorrect_dir = base_output / "incorrect"
+        else:
+            batch_dir = base_output / f"batch{current_batch}"
+            correct_dir = batch_dir / "correct"
+            incorrect_dir = batch_dir / "incorrect"
+
+        for cls in CLASS_NAMES:
+            os.makedirs(correct_dir / cls, exist_ok=True)
+
+        return correct_dir, incorrect_dir
+
+    correct_dir, incorrect_dir = get_dirs()
 
     cap = cv2.VideoCapture(str(video_path))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -118,12 +136,68 @@ def run(video_path, json_path, model_path, output_dir):
 
     total = correct = 0
     tp_readable = fp_readable = fn_readable = 0
-
     total_infer_time = 0
 
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frame")
-
     frame_idx = 0
+
+    def process_batch(preds, frame_indices, original_frames):
+        nonlocal total, correct
+        nonlocal tp_readable, fp_readable, fn_readable
+        nonlocal current_batch, current_batch_size, batching_enabled
+        nonlocal correct_dir, incorrect_dir
+
+        for i, pred_idx in enumerate(preds):
+            idx = frame_indices[i]
+
+            if idx not in gt_labels:
+                continue
+
+            gt = gt_labels[idx]
+            pred = CLASS_NAMES[pred_idx]
+
+            filename = f"frame_{idx:06d}.jpg"
+
+            total += 1
+
+            if pred == gt:
+                dest = correct_dir / gt / filename
+                correct += 1
+            else:
+                dest = incorrect_dir / f"{gt}_pred_{pred}" / filename
+                dest.parent.mkdir(parents=True, exist_ok=True)
+
+            # Readable metrics
+            if pred == "Readable":
+                if gt == "Readable":
+                    tp_readable += 1
+                else:
+                    fp_readable += 1
+            if gt == "Readable" and pred != "Readable":
+                fn_readable += 1
+
+            frame = original_frames[i]
+            frame_size = get_file_size_bytes(frame)
+
+            # ---- BATCHING LOGIC ----
+            if not batching_enabled:
+                if current_batch_size + frame_size > MAX_BATCH_SIZE:
+                    batching_enabled = True
+                    current_batch = 2
+                    current_batch_size = 0
+                    correct_dir, incorrect_dir = get_dirs()
+                    print(f"Exceeded 4GB → switching to batch2")
+
+            else:
+                if current_batch_size + frame_size > MAX_BATCH_SIZE:
+                    current_batch += 1
+                    current_batch_size = 0
+                    correct_dir, incorrect_dir = get_dirs()
+                    print(f"Switching to batch{current_batch}")
+
+            current_batch_size += frame_size
+            cv2.imwrite(str(dest), frame)
+
 
     while True:
         ret, frame = cap.read()
@@ -142,7 +216,6 @@ def run(video_path, json_path, model_path, output_dir):
         frame_indices.append(frame_idx)
         original_frames.append(frame)
 
-        # Run batch
         if len(buffer) == BATCH_SIZE:
             start_inf = time.time()
 
@@ -151,36 +224,7 @@ def run(video_path, json_path, model_path, output_dir):
 
             total_infer_time += time.time() - start_inf
 
-            # Process batch
-            for i, pred_idx in enumerate(preds):
-                idx = frame_indices[i]
-
-                if idx not in gt_labels:
-                    continue
-
-                gt = gt_labels[idx]
-                pred = CLASS_NAMES[pred_idx]
-
-                filename = f"frame_{idx:06d}.jpg"
-
-                total += 1
-                if pred == gt:
-                    correct += 1
-                    dest = correct_dir / gt / filename
-                else:
-                    dest = incorrect_dir / f"{gt}_pred_{pred}" / filename
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-
-                # Readable metrics
-                if pred == "Readable":
-                    if gt == "Readable":
-                        tp_readable += 1
-                    else:
-                        fp_readable += 1
-                if gt == "Readable" and pred != "Readable":
-                    fn_readable += 1
-
-                cv2.imwrite(str(dest), original_frames[i])
+            process_batch(preds, frame_indices, original_frames)
 
             buffer, frame_indices, original_frames = [], [], []
 
@@ -189,32 +233,13 @@ def run(video_path, json_path, model_path, output_dir):
 
     cap.release()
 
-    # leftover batch
+    # leftover
     if buffer:
         batch_tensor = torch.stack(buffer).to(DEVICE)
         preds, _ = infer_batch(model, batch_tensor)
+        process_batch(preds, frame_indices, original_frames)
 
-        for i, pred_idx in enumerate(preds):
-            idx = frame_indices[i]
-
-            if idx not in gt_labels:
-                continue
-
-            gt = gt_labels[idx]
-            pred = CLASS_NAMES[pred_idx]
-
-            filename = f"frame_{idx:06d}.jpg"
-
-            total += 1
-            if pred == gt:
-                correct += 1
-                dest = correct_dir / gt / filename
-            else:
-                dest = incorrect_dir / f"{gt}_pred_{pred}" / filename
-                dest.parent.mkdir(parents=True, exist_ok=True)
-
-            cv2.imwrite(str(dest), original_frames[i])
-
+    # --------- METRICS ---------
     accuracy = correct / total if total else 0
     precision = tp_readable / (tp_readable + fp_readable) if (tp_readable + fp_readable) else 0
     recall = tp_readable / (tp_readable + fn_readable) if (tp_readable + fn_readable) else 0
@@ -237,6 +262,7 @@ def run(video_path, json_path, model_path, output_dir):
     print(f"Total inference time: {total_infer_time:.2f} sec")
     print("DONE")
 
+# ---------------- MULTI VIDEO ----------------
 def run_on_folder(video_dir, model_path, output_dir):
     video_dir = Path(video_dir)
 
@@ -251,14 +277,13 @@ def run_on_folder(video_dir, model_path, output_dir):
 
     print(f"Found {len(video_files)} videos.\n")
 
-    total_videos = len(video_files)
     overall_start = time.time()
 
     for i, video_path in enumerate(video_files, 1):
         video_name = video_path.stem
         json_path = video_dir / video_name / "Train.json"
 
-        print(f"\n[{i}/{total_videos}] Processing: {video_name}")
+        print(f"\n[{i}/{len(video_files)}] Processing: {video_name}")
 
         if not json_path.exists():
             print(f"Skipping {video_name} (Train.json not found)")
@@ -279,14 +304,4 @@ if __name__ == "__main__":
     MODEL_PATH = BASE_DIR / "model.pt"
     OUTPUT_DIR = BASE_DIR / "results"
 
-    # Run single video
-    # run(
-    #     VIDEO_DIR / "UC 05D.mp4",
-    #     VIDEO_DIR / "UC 05D" / "Train.json",
-    #     MODEL_PATH,
-    #     OUTPUT_DIR
-    # )
-
-    # Run entire folder
     run_on_folder(VIDEO_DIR, MODEL_PATH, OUTPUT_DIR)
-

@@ -23,6 +23,7 @@ READABLE_IDX = CLASS_NAMES.index("Readable")
 
 BATCH_SIZE = 2
 FRAME_SKIP = 4
+MAX_BATCH_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
 
 torch.set_num_threads(torch.get_num_threads())
 print(f"Using {torch.get_num_threads()} CPU thread.")
@@ -32,6 +33,13 @@ transform = transforms.Compose([
     transforms.Resize((380, 380)),
     transforms.ToTensor(),
 ])
+
+# ---------------- UTILS ----------------
+def get_file_size_bytes(frame):
+    success, encoded = cv2.imencode('.jpg', frame)
+    if not success:
+        return 0
+    return len(encoded)
 
 # ---------------- MODEL ----------------
 def load_model(model_path):
@@ -46,13 +54,11 @@ def infer_batch(model, batch_tensor):
         outputs_flip = model(torch.flip(batch_tensor, dims=[3]))
         outputs = (outputs_orig + outputs_flip) / 2
 
-        # Readable bias
         outputs[:, READABLE_IDX] += 0.0
 
         probs = torch.softmax(outputs, dim=1)
         pred = outputs.argmax(1)
 
-        # Threshold forcing
         pred = torch.where(
             probs[:, READABLE_IDX] > 0.3,
             torch.full_like(pred, READABLE_IDX),
@@ -71,8 +77,24 @@ def run(video_path, model_path, output_dir):
     model = load_model(model_path)
 
     base_output = Path(output_dir) / video_name
-    for cls in CLASS_NAMES:
-        os.makedirs(base_output / cls, exist_ok=True)
+
+    # ---- BATCH CONTROL ----
+    current_batch = 1
+    current_batch_size = 0
+    batching_enabled = False
+
+    def get_dirs():
+        if not batching_enabled:
+            base = base_output
+        else:
+            base = base_output / f"batch{current_batch}"
+
+        for cls in CLASS_NAMES:
+            os.makedirs(base / cls, exist_ok=True)
+
+        return base
+
+    current_base = get_dirs()
 
     cap = cv2.VideoCapture(str(video_path))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -88,6 +110,40 @@ def run(video_path, model_path, output_dir):
 
     frame_idx = 0
 
+    def process_batch(preds, frame_indices, original_frames):
+        nonlocal current_batch, current_batch_size, batching_enabled
+        nonlocal current_base
+
+        for i, pred_idx in enumerate(preds):
+            pred = CLASS_NAMES[pred_idx]
+            filename = f"frame_{frame_indices[i]:06d}.jpg"
+
+            frame = original_frames[i]
+            frame_size = get_file_size_bytes(frame)
+
+            # ---- BATCHING LOGIC ----
+            if not batching_enabled:
+                if current_batch_size + frame_size > MAX_BATCH_SIZE:
+                    batching_enabled = True
+                    current_batch = 2
+                    current_batch_size = 0
+                    current_base = get_dirs()
+                    print("Exceeded 4GB → switching to batch2")
+            else:
+                if current_batch_size + frame_size > MAX_BATCH_SIZE:
+                    current_batch += 1
+                    current_batch_size = 0
+                    current_base = get_dirs()
+                    print(f"Switching to batch{current_batch}")
+
+            current_batch_size += frame_size
+
+            dest = current_base / pred / filename
+            cv2.imwrite(str(dest), frame)
+
+            class_counts[pred] += 1
+
+    # -------- LOOP --------
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -105,7 +161,6 @@ def run(video_path, model_path, output_dir):
         original_frames.append(frame)
         frame_indices.append(frame_idx)
 
-        # Run batch
         if len(buffer) == BATCH_SIZE:
             start_inf = time.time()
 
@@ -114,14 +169,7 @@ def run(video_path, model_path, output_dir):
 
             total_infer_time += time.time() - start_inf
 
-            for i, pred_idx in enumerate(preds):
-                pred = CLASS_NAMES[pred_idx]
-                filename = f"frame_{frame_indices[i]:06d}.jpg"
-
-                dest = base_output / pred / filename
-                cv2.imwrite(str(dest), original_frames[i])
-
-                class_counts[pred] += 1
+            process_batch(preds, frame_indices, original_frames)
 
             buffer, original_frames, frame_indices = [], [], []
 
@@ -130,23 +178,15 @@ def run(video_path, model_path, output_dir):
 
     cap.release()
 
-    # leftover batch
+    # leftover
     if buffer:
         batch_tensor = torch.stack(buffer).to(DEVICE)
         preds = infer_batch(model, batch_tensor)
-
-        for i, pred_idx in enumerate(preds):
-            pred = CLASS_NAMES[pred_idx]
-            filename = f"frame_{frame_indices[i]:06d}.jpg"
-
-            dest = base_output / pred / filename
-            cv2.imwrite(str(dest), original_frames[i])
-
-            class_counts[pred] += 1
+        process_batch(preds, frame_indices, original_frames)
 
     total_time = time.time() - start_time
 
-    # Save report
+    # -------- REPORT --------
     report_path = base_output / "report.txt"
     with open(report_path, "w") as f:
         f.write(f"Video: {video_name}\n")
@@ -161,6 +201,7 @@ def run(video_path, model_path, output_dir):
     print(f"Total inference time: {total_infer_time:.2f} sec")
     print("DONE")
 
+# ---------------- MULTI VIDEO ----------------
 def run_on_folder(video_dir, model_path, output_dir):
     video_dir = Path(video_dir)
 
@@ -195,5 +236,4 @@ if __name__ == "__main__":
     MODEL_PATH = BASE_DIR / "model.pt"
     OUTPUT_DIR = BASE_DIR / "results_unsupervised"
 
-    # run("D:/model validation 2/UC 05D.mp4", MODEL_PATH, OUTPUT_DIR)
     run_on_folder(VIDEO_DIR, MODEL_PATH, OUTPUT_DIR)
